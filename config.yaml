@@ -1,0 +1,85 @@
+region:
+  name: "Uttarakhand"
+  bbox:                     # [min_lon, min_lat, max_lon, max_lat] - approx Uttarakhand extent
+    min_lon: 77.57
+    min_lat: 28.71
+    max_lon: 81.03
+    max_lat: 31.45
+  crs: "EPSG:32644"          # UTM Zone 44N (metric, required for 30m grid + CA spread)
+  resolution_m: 30           # mandated output raster resolution
+
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  synthetic_dir: "data/synthetic"
+  models_dir: "models"
+  outputs_dir: "outputs"
+  maps_dir: "outputs/maps"
+  animations_dir: "outputs/animations"
+
+data_sources:
+  lulc:
+    provider: "Bhuvan / Sentinel Hub (LULC 30m)"
+    classes: ["forest_dense", "forest_open", "scrub", "grassland", "agriculture", "settlement", "water", "barren"]
+  dem:
+    provider: "Bhoonidhi Portal (CartoDEM / 30m DEM)"
+    derived: ["slope_deg", "aspect_deg"]
+  weather:
+    provider: "IMD / ERA-5 / MOSDAC"
+    variables: ["temperature_c", "rh_percent", "wind_speed_kmph", "wind_dir_deg", "rainfall_mm"]
+  fire_history:
+    provider: "VIIRS-SNPP / MODIS Active Fire (FIRMS)"
+    variables: ["frp", "confidence", "acq_date"]
+  human_factors:
+    provider: "GHSL (settlement layer), OSM (roads)"
+    variables: ["dist_to_settlement_m", "dist_to_road_m"]
+
+synthetic_data:
+  grid_height: 512            # rows  (~15.4 km at 30m -> scaled demo grid)
+  grid_width: 512              # cols
+  n_historical_days: 180        # for LSTM-style temporal context / training set
+  fire_season_doy_range: [60, 165]   # Mar-Jun, typical Uttarakhand fire season
+  random_seed: 42
+
+prediction_model:
+  architecture: "U-NET"
+  input_channels: 13
+  # lulc_norm, slope, aspect_sin, aspect_cos, ndvi, fuel_load, temperature, rh,
+  # wind_speed, wind_dir_sin, wind_dir_cos, rainfall, dist_to_road
+  num_classes: 4              # nil, low, moderate, high  (mapped to legend: very_less/less/moderate/high(+very_high))
+  base_filters: 32
+  depth: 4
+  batch_size: 8
+  epochs: 40
+  learning_rate: 0.0001
+  val_split: 0.15
+  test_split: 0.15
+  patch_size: 256
+  patch_stride: 128
+
+lstm_model:
+  architecture: "ConvLSTM (auxiliary, temporal weather sequence)"
+  sequence_length: 7           # days of antecedent weather
+  hidden_dim: 16
+  epochs: 30
+  learning_rate: 0.001
+
+spread_simulation:
+  method: "Cellular Automata"
+  cell_size_m: 30
+  time_step_minutes: 10
+  durations_hours: [1, 2, 3, 6, 12]
+  base_spread_probability: 0.22
+  wind_effect_factor: 0.45
+  slope_effect_factor: 0.30
+  fuel_effect_factor: 0.30
+  moisture_suppression_factor: 0.35
+  burn_duration_steps: 6        # ~60 min base burn-out time, scaled up by fuel load per cell
+  spotting_enabled: true
+  spotting_probability: 0.015
+  spotting_max_distance_cells: 4
+  neighborhood: "moore_8"      # 8-connected neighborhood (N,S,E,W + diagonals)
+
+evaluation:
+  classification_metrics: ["accuracy", "precision", "recall", "f1", "auc_roc", "iou", "kappa"]
+  spread_metrics: ["jaccard_similarity", "boundary_displacement_error_m", "area_growth_rate_error_pct"]
