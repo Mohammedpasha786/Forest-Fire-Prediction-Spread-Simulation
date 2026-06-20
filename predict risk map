@@ -1,0 +1,147 @@
+Runs the trained FireRiskUNet over the full scene (via overlapping-patch
+inference with averaging at seams) and writes:
+    outputs/maps/fire_risk_prediction.tif   - 30m GeoTIFF, classes 0-3
+    outputs/maps/fire_risk_prediction.png   - styled visualization
+        (Very Less / Less / Moderate / High / Very High legend, matching
+        the reference figure's color scheme: green -> yellow -> orange -> red)
+
+This directly satisfies Objective 1: "Prepare a forest fire probability map
+for the next day... Generate a binary classification map (fire/no fire)."
+The 4-class output can be thresholded to binary (classes 2,3 = "fire risk")
+if a strict binary map is required; both are written.
+
+import os
+import json
+import numpy as np
+import rasterio
+import torch
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.pyplot as plt
+import yaml
+
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from prediction.unet_model import FireRiskUNet
+
+HERE = os.path.dirname(__file__)
+ROOT = os.path.join(HERE, "..", "..")
+
+# Matches reference legend: Very Less (green) -> Less (light green) -> Moderate (tan) -> High (orange) -> Very High (red)
+RISK_COLORS = ["#3CB44B", "#D9EAD3", "#F4D58D", "#E07B00"]  # 4-class fallback (no separate very-high split in 4-class label)
+RISK_LABELS = ["Very Less / Nil", "Less / Low", "Moderate", "High"]
+
+
+def load_config():
+    with open(os.path.join(ROOT, "configs", "config.yaml")) as f:
+        return yaml.safe_load(f)
+
+
+def sliding_window_predict(model, features, patch_size, stride, num_classes, device):
+    c, h, w = features.shape
+    prob_accum = np.zeros((num_classes, h, w), dtype=np.float32)
+    count_accum = np.zeros((h, w), dtype=np.float32)
+
+    ys = list(range(0, max(h - patch_size, 0) + 1, stride)) or [0]
+    xs = list(range(0, max(w - patch_size, 0) + 1, stride)) or [0]
+    if ys[-1] + patch_size < h:
+        ys.append(h - patch_size)
+    if xs[-1] + patch_size < w:
+        xs.append(w - patch_size)
+
+    model.eval()
+    with torch.no_grad():
+        for y in ys:
+            for x in xs:
+                y_end, x_end = min(y + patch_size, h), min(x + patch_size, w)
+                patch = features[:, y:y_end, x:x_end]
+                pad_h, pad_w = patch_size - patch.shape[1], patch_size - patch.shape[2]
+                if pad_h > 0 or pad_w > 0:
+                    patch = np.pad(patch, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect")
+
+                tensor = torch.from_numpy(patch).unsqueeze(0).to(device)
+                logits = model(tensor)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                probs = probs[:, :y_end - y, :x_end - x]
+
+                prob_accum[:, y:y_end, x:x_end] += probs
+                count_accum[y:y_end, x:x_end] += 1
+
+    count_accum = np.maximum(count_accum, 1e-6)
+    prob_accum /= count_accum[None, :, :]
+    risk_class = np.argmax(prob_accum, axis=0).astype(np.uint8)
+    return risk_class, prob_accum
+
+
+def save_geotiff(array, transform, crs, out_path, dtype="uint8", nodata=None):
+    with rasterio.open(
+        out_path, "w", driver="GTiff", height=array.shape[0], width=array.shape[1],
+        count=1, dtype=dtype, crs=crs, transform=transform, nodata=nodata, compress="lzw",
+    ) as dst:
+        dst.write(array.astype(dtype), 1)
+
+
+def save_visualization(risk_class, out_path, title="Forest Fire Risk Prediction Map"):
+    cmap = ListedColormap(RISK_COLORS)
+    bounds = [0, 1, 2, 3, 4]
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(risk_class, cmap=cmap, norm=norm)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.set_xticks([]); ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("black")
+
+    cbar = fig.colorbar(im, ax=ax, ticks=[0.5, 1.5, 2.5, 3.5], fraction=0.04, pad=0.03)
+    cbar.ax.set_yticklabels(RISK_LABELS)
+    cbar.set_label("Risk Class", fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def predict(config):
+    pred_cfg = config["prediction_model"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    processed_dir = os.path.join(ROOT, config["paths"]["processed_dir"])
+    features = np.load(os.path.join(processed_dir, "feature_stack.npy"))
+    with open(os.path.join(processed_dir, "feature_manifest.json")) as f:
+        manifest = json.load(f)
+
+    model = FireRiskUNet(
+        in_channels=pred_cfg["input_channels"], num_classes=pred_cfg["num_classes"],
+        base_filters=pred_cfg["base_filters"], depth=pred_cfg["depth"],
+    ).to(device)
+    model_path = os.path.join(ROOT, config["paths"]["models_dir"], "fire_unet_best.pt")
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    print(f"Loaded model from {model_path}")
+
+    risk_class, probs = sliding_window_predict(
+        model, features, pred_cfg["patch_size"], pred_cfg["patch_stride"],
+        pred_cfg["num_classes"], device,
+    )
+
+    transform = rasterio.transform.Affine(*manifest["transform"])
+    crs = manifest["crs"]
+    maps_dir = os.path.join(ROOT, config["paths"]["maps_dir"])
+    os.makedirs(maps_dir, exist_ok=True)
+
+    save_geotiff(risk_class, transform, crs, os.path.join(maps_dir, "fire_risk_prediction.tif"))
+    np.save(os.path.join(maps_dir, "fire_risk_probabilities.npy"), probs)
+
+    binary_map = (risk_class >= 2).astype(np.uint8)  # moderate+high -> "fire" class
+    save_geotiff(binary_map, transform, crs, os.path.join(maps_dir, "fire_binary_prediction.tif"))
+
+    save_visualization(risk_class, os.path.join(maps_dir, "fire_risk_prediction.png"))
+
+    print(f"Risk class distribution: {dict(zip(*np.unique(risk_class, return_counts=True)))}")
+    print(f"Outputs written to {maps_dir}")
+    return risk_class, probs
+
+
+if __name__ == "__main__":
+    cfg = load_config()
+    predict(cfg)
